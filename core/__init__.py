@@ -1,0 +1,1 @@
+# BugHunter CLI - Core package

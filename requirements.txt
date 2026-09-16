@@ -1,0 +1,8 @@
+httpx==0.28.1
+beautifulsoup4==4.15.0
+rich==15.0.0
+
+# Test dependencies
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-httpx==0.36.2

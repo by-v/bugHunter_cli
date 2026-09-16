@@ -1,0 +1,37 @@
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test & cache directories
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local scan history (sensitive: target URLs, endpoints, triage data)
+reports/*
+!reports/.gitkeep
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment / secrets files
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# Logs
+*.log
+
+# Local throwaway test fixtures
+test.html
+
+# OS / editor files
+.DS_Store
+.idea/
+.vscode/
