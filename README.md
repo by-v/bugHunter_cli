@@ -289,15 +289,9 @@ The developer provides this software **as-is**, without warranty of any kind, an
 
 ---
 
-## Developer Credit
+## Credit
 
-| | |
-|---|---|
-| **Developer** | **V0o** |
-| **Role** | Security Engineering / Python Core Development |
-| **Focus** | DAST automation, async architecture, false-positive reduction |
-| **Project Status** | Active Development — Portfolio Project |
-| **Tech Stack** | Python 3.11+ · `httpx` · `asyncio` · BeautifulSoup4 · `rich` · `pytest` |
+Made with ☕ by **[V]**
 
 ---
 
