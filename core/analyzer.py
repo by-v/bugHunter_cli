@@ -94,7 +94,16 @@ class Analyzer:
         r"(?i)usage:\s+\S+\s+\[.*\]",
         r"(?i)unknown option",
         r"(?i)invalid argument",
-        r"(?i)permission denied",
+        # Context-sensitive: shell/executor "Permission denied" only. The bare
+        # phrase is a strong shell signal (sh: 1: ./id: Permission denied) but
+        # is ALSO emitted by PHP include_scope errors (DVWA File Inclusion:
+        # "Failed to open stream: Permission denied"). Requiring a shell/bin
+        # name + reflected path before "permission denied" kills that FP while
+        # keeping the real command-injection evidence.
+        r"(?i)(?:sh|bash|zsh|dash|ksh|csh|ash|sudo)(?::\s*\d+)?:\s+[^:]+:\s+permission denied",
+        r"(?i)(?:-\s*)?(?:sh|bash|zsh|dash|ksh|csh|ash|sudo):\s+[^:]+:\s+permission denied",
+        r"(?i)unable to execute.*permission denied",
+        r"(?i)cannot run program.*error=\d+,?\s*permission denied",
         r"(?i)cannot execute",
         r"(?i)process failed",
     ]
@@ -202,20 +211,45 @@ class Analyzer:
         """Check if latency suggests time-based injection."""
         return latency_ms > (self.base_latency_ms + self.latency_threshold_ms)
 
+    @staticmethod
+    def _context_snippet(response_text: str, needle: str, window: int = 60) -> str:
+        """Return a short response excerpt centred on ``needle``.
+
+        Diagnostic evidence proving the payload/error string actually appears
+        in the server response (used as ``matched_snippet`` in reports).
+        """
+        if not needle:
+            return ""
+        index = response_text.lower().find(needle.lower())
+        if index == -1:
+            return ""
+        start = max(0, index - window)
+        end = min(len(response_text), index + len(needle) + window)
+        snippet = response_text[start:end]
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(response_text):
+            snippet = snippet + "..."
+        return snippet
+
     def _check_status_change(
         self,
         status_code: int,
         normal_status: int = 200,
     ) -> tuple[bool, str | None]:
-        """Check for unexpected HTTP status changes."""
-        if status_code == 500:
-            return True, "Internal Server Error"
-        if status_code == 403:
-            return True, "Forbidden"
-        if status_code == 404:
-            return True, "Not Found"
-        if status_code == 302 or status_code == 301:
-            return True, "Redirect detected"
+        """Check for genuinely unexpected server responses.
+
+        Only server-side failures (HTTP 5xx) and connection/timeout failures
+        are reported as error exposure. Client errors (4xx) typically indicate
+        dead links, wrong paths or unauthenticated pages rather than an
+        injection-induced fault, so they are intentionally ignored to keep the
+        report free of noise. ``normal_status`` is retained for report context.
+        """
+        if status_code == 429:
+            # Rate limiting is a scanner-control signal, not a vulnerability.
+            return False, None
+        if status_code >= 500:
+            return True, f"HTTP {status_code} Server Error"
         if status_code == 0:
             return True, "Connection failed"
         return False, None
@@ -256,6 +290,9 @@ class Analyzer:
                         "param": fuzz_result.param_name,
                         "payload": fuzz_result.payload,
                         "status_code": str(fuzz_result.status_code),
+                        "matched_snippet": self._context_snippet(
+                            fuzz_result.response_text, evidence or ""
+                        ),
                     },
                 )
             )
@@ -278,6 +315,9 @@ class Analyzer:
                         "param": fuzz_result.param_name,
                         "payload": fuzz_result.payload,
                         "status_code": str(fuzz_result.status_code),
+                        "matched_snippet": self._context_snippet(
+                            fuzz_result.response_text, evidence or ""
+                        ),
                     },
                 )
             )
@@ -300,6 +340,9 @@ class Analyzer:
                         "param": fuzz_result.param_name,
                         "payload": fuzz_result.payload,
                         "status_code": str(fuzz_result.status_code),
+                        "matched_snippet": self._context_snippet(
+                            fuzz_result.response_text, payload_injected
+                        ),
                     },
                 )
             )
@@ -322,6 +365,9 @@ class Analyzer:
                         "param": fuzz_result.param_name,
                         "payload": fuzz_result.payload,
                         "status_code": str(fuzz_result.status_code),
+                        "matched_snippet": self._context_snippet(
+                            fuzz_result.response_text, evidence or ""
+                        ),
                     },
                 )
             )

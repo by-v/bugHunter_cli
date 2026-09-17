@@ -34,6 +34,31 @@ class URLInfo:
 class Crawler:
     """Crawl a target URL and extract all accessible pages, parameters, and forms."""
 
+    _CSRF_INPUT_NAMES = frozenset(
+        (
+            "_token",
+            "csrf_token",
+            "csrf-token",
+            "authenticity_token",
+            "csrfmiddlewaretoken",
+            "user_token",
+        )
+    )
+
+    _SESSION_BLACKLIST = frozenset(
+        (
+            "logout",
+            "logoff",
+            "log-out",
+            "signout",
+            "sign-out",
+            "deconnexion",
+            "deconnection",
+        )
+    )
+
+    _ACTION_PARAMS = frozenset(("action", "do", "cmd", "op", "operation", "mode"))
+
     def __init__(
         self,
         target_url: str,
@@ -42,6 +67,7 @@ class Crawler:
         follow_subdomains: bool = False,
         on_discover: Callable[[URLInfo], None] | None = None,
         max_concurrent: int = 10,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         """Initialize crawler.
 
@@ -52,6 +78,7 @@ class Crawler:
             follow_subdomains: Whether to follow URLs on subdomains.
             on_discover: Optional callback when URL discovered.
             max_concurrent: Maximum concurrent requests.
+            client: Optional httpx.AsyncClient to reuse (keeps session cookies).
         """
         parsed = urlparse(target_url)
         self.base_domain = parsed.netloc
@@ -60,12 +87,39 @@ class Crawler:
         self.timeout = httpx.Timeout(timeout, connect=timeout)
         self.on_discover = on_discover
         self.max_concurrent = max_concurrent
+        self._client = client
+        self._owns_client = client is None
+
+        path_parts = [p for p in parsed.path.split("/") if p]
+        self._base_path = "/" + path_parts[0] + "/" if path_parts else "/"
 
         self._visited: Set[str] = set()
         self._to_visit: deque[tuple[str, int]] = deque()
         self._discovered: List[URLInfo] = []
 
         self._to_visit.append((target_url, 0))
+
+    @staticmethod
+    def _is_session_killer(url: str) -> bool:
+        """Return True if URL matches destructive session keywords."""
+        url_lower = url.lower()
+        parsed = urlparse(url_lower)
+        for seg in parsed.path.split("/"):
+            if any(kw in seg for kw in Crawler._SESSION_BLACKLIST):
+                return True
+        query = parse_qs(parsed.query)
+        for key, values in query.items():
+            if key in Crawler._SESSION_BLACKLIST:
+                return True
+            if key in Crawler._ACTION_PARAMS:
+                if any(v in Crawler._SESSION_BLACKLIST for v in values):
+                    return True
+        return False
+
+    def _is_out_of_scope(self, url: str) -> bool:
+        """Return True if URL falls outside the target base path."""
+        parsed = urlparse(url)
+        return not parsed.path.startswith(self._base_path)
 
     async def _normalize_url(self, url: str, base: str) -> str | None:
         """Normalize and validate URL against target domain."""
@@ -87,11 +141,28 @@ class Crawler:
             ):
                 return None
 
-            normalized = parsed._replace(query="").geturl()
+            clean_url = parsed.geturl()
+            if self._is_out_of_scope(clean_url):
+                return None
+            if self._is_session_killer(clean_url):
+                return None
+
+            normalized = parsed.geturl()
             return normalized.rstrip("/") or normalized + "/"
 
         except Exception:
             return None
+
+    @staticmethod
+    def _dedup_key(url: str) -> str:
+        """Return a single-visit key ignoring query and fragment.
+
+        Allows the same page reached through different query strings to be
+        crawled once, while discovered URLInfo entries still keep their full
+        query parameters for fuzzing.
+        """
+        parsed = urlparse(url)
+        return parsed._replace(query="", fragment="").geturl()
 
     def _extract_params(self, url: str) -> dict[str, list[str]]:
         """Extract query parameters from URL."""
@@ -101,20 +172,51 @@ class Crawler:
             for k, v in parse_qs(parsed.query).items()
         }
 
+    @staticmethod
+    def _get_csrf_token(soup: BeautifulSoup, form: object) -> str:
+        """Extract a CSRF token from the form or a document meta tag.
+
+        Checks hidden inputs (``_token``, ``csrfmiddlewaretoken``, ...) first,
+        then falls back to ``<meta name="csrf-token">``.
+
+        Returns:
+            The CSRF token value, or an empty string when none is found.
+        """
+        for input_elem in form.find_all(["input", "select", "textarea"]):
+            name = input_elem.get("name", "")
+            if name in Crawler._CSRF_INPUT_NAMES:
+                value = input_elem.get("value", "")
+                if value:
+                    return value
+
+        meta = soup.find("meta", attrs={"name": "csrf-token"})
+        if meta is None:
+            meta = soup.find("meta", attrs={"name": "csrf_token"})
+        if meta is not None:
+            return meta.get("content", "")
+
+        return ""
+
     def _extract_forms(self, html: str) -> list[dict[str, str]]:
         """Extract form inputs from HTML."""
         soup = BeautifulSoup(html, "html.parser")
-        forms = []
+        forms: list[dict[str, str]] = []
 
         for form in soup.find_all("form"):
             form_action = form.get("action", "")
             form_method = (form.get("method") or "get").lower()
 
-            inputs: dict[str, str] = {"_method": form_method, "_action": form_action}
+            inputs: dict[str, str] = {
+                "_method": form_method,
+                "_action": form_action,
+                "_csrf_token": self._get_csrf_token(soup, form),
+            }
 
             for input_elem in form.find_all(["input", "textarea", "select"]):
                 name = input_elem.get("name")
                 if not name:
+                    continue
+                if name in self._CSRF_INPUT_NAMES:
                     continue
 
                 input_type = input_elem.get("type", "text").lower()
@@ -169,7 +271,7 @@ class Crawler:
 
         links = await self._extract_links(response.text, url)
         for link in links:
-            if link not in self._visited:
+            if self._dedup_key(link) not in self._visited:
                 self._to_visit.append((link, depth + 1))
 
     async def _crawl_single(
@@ -179,10 +281,11 @@ class Crawler:
         depth: int,
     ) -> None:
         """Crawl a single URL."""
-        if url in self._visited:
+        key = self._dedup_key(url)
+        if key in self._visited:
             return
 
-        self._visited.add(url)
+        self._visited.add(key)
 
         try:
             response = await client.get(url, follow_redirects=True)
@@ -195,7 +298,15 @@ class Crawler:
 
     async def crawl(self) -> List[URLInfo]:
         """Run the crawler asynchronously and return all discovered URLs."""
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+        # Use provided client or create a new one
+        if self._client is not None:
+            client = self._client
+            close_client = False
+        else:
+            client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True)
+            close_client = True
+
+        try:
             semaphore = asyncio.Semaphore(self.max_concurrent)
 
             async def crawl_with_semaphore(url: str, depth: int) -> None:
@@ -206,7 +317,10 @@ class Crawler:
                 url, depth = self._to_visit.popleft()
                 await crawl_with_semaphore(url, depth)
 
-        return self._discovered
+            return self._discovered
+        finally:
+            if close_client:
+                await client.aclose()
 
     @property
     def discovered(self) -> List[URLInfo]:
@@ -214,15 +328,20 @@ class Crawler:
         return self._discovered
 
 
-async def crawl(target_url: str, max_depth: int = 3) -> List[URLInfo]:
+async def crawl(
+    target_url: str,
+    max_depth: int = 3,
+    client: httpx.AsyncClient | None = None,
+) -> List[URLInfo]:
     """Convenience async function to crawl a target URL.
 
     Args:
         target_url: Starting URL for crawling.
         max_depth: Maximum crawl depth.
+        client: Optional httpx.AsyncClient to reuse (keeps session cookies).
 
     Returns:
         List of discovered URLs with parameters and forms.
     """
-    crawler = Crawler(target_url, max_depth=max_depth)
+    crawler = Crawler(target_url, max_depth=max_depth, client=client)
     return await crawler.crawl()

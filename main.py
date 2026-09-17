@@ -15,6 +15,7 @@ import asyncio
 import sys
 import uuid
 from datetime import datetime
+from urllib.parse import urlparse
 from typing import TYPE_CHECKING
 
 import httpx
@@ -119,12 +120,85 @@ Examples:
         help="Enable verbose output",
     )
 
+    parser.add_argument(
+        "--cookie",
+        default="",
+        help='Session cookies to send with every request (format: "name1=val1; name2=val2")',
+    )
+
     return parser.parse_args()
+
+
+def parse_cookie_string(cookie_str: str) -> dict[str, str]:
+    """Parse an HTTP cookie header string into a cookie dict.
+
+    Lenient parser: surrounding whitespace is trimmed and malformed segments
+    (lacking "=") are silently skipped so a bad cookie never aborts a scan.
+    Values are split on the first "=" to preserve embedded "=" characters.
+
+    Args:
+        cookie_str: Raw cookies such as "name1=val1; name2=val2".
+
+    Returns:
+        Mapping of cookie name to value, empty for empty input.
+    """
+    parsed: dict[str, str] = {}
+    if not cookie_str:
+        return parsed
+
+    for segment in cookie_str.split(";"):
+        segment = segment.strip()
+        if not segment or "=" not in segment:
+            continue
+        name, value = segment.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name:
+            parsed[name] = value
+
+    return parsed
 
 
 def on_discover(url_info: URLInfo) -> None:
     """Callback when URL is discovered during crawling."""
     console.print(f"  [cyan][+][cyan] Discovered: {url_info.url}")
+
+
+async def _probe_login_gate(
+    client: httpx.AsyncClient,
+    target_url: str,
+) -> str | None:
+    """Probe whether a supplied session cookie is actually effective.
+
+    Performs a clean request to the target and looks for classic login-gate
+    fingerprints (a final URL pointing at a login page, or a rendered form
+    containing a password field). Returns a description when a gate is found,
+    otherwise None.
+
+    Args:
+        client: Shared httpx async client (must carry the session cookies).
+        target_url: Starting URL of the scan.
+
+    Returns:
+        Human-readable description of the detected login gate or None.
+    """
+    try:
+        response = await client.get(target_url, follow_redirects=True)
+    except (httpx.RequestError, httpx.TimeoutException):
+        return None
+
+    final_url = str(response.url)
+    if "login" in urlparse(final_url).path.lower():
+        return f"the target redirected to a login page ({final_url})"
+
+    text = response.text or ""
+    if not isinstance(text, str):
+        return None
+    low = text.lower()
+    if "<form" in low and 'type="password"' in low:
+        return "the target rendered a login form (password input detected)"
+
+    return None
 
 
 async def run_scan_async(
@@ -133,6 +207,7 @@ async def run_scan_async(
     threads: int,
     output_dir: str,
     verbose: bool,
+    cookies: dict[str, str] | None = None,
 ) -> int:
     """Run the full DAST scan pipeline asynchronously.
 
@@ -142,6 +217,7 @@ async def run_scan_async(
         threads: Number of concurrent HTTP requests.
         output_dir: Directory for report output.
         verbose: Enable verbose output.
+        cookies: Optional session cookies to send with every request.
 
     Returns:
         Exit code (0 for success, 1 for errors).
@@ -154,48 +230,64 @@ async def run_scan_async(
     console.print(f"[bold]Target:[/bold] {target_url}")
     console.print(f"[bold]Depth:[/bold] {depth}")
     console.print(f"[bold]Threads:[/bold] {threads}")
+    if cookies:
+        console.print(f"[bold]Cookies:[/bold] {len(cookies)} session cookie(s)")
     console.print()
 
     reporter = Reporter(output_dir)
-
-    # Step 1: Crawl
-    console.print("[bold yellow]Step 1/4:[/bold yellow] Crawling target...", style="cyan")
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        crawl_task = progress.add_task("Crawling...", total=None)
-        try:
-            discovered_urls = await do_crawl(target_url, max_depth=depth)
-            progress.remove_task(crawl_task)
-        except Exception as e:
-            console.print(f"[red]Crawling failed:[/red] {e}")
-            return 1
-
-    console.print(f"[green]Found {len(discovered_urls)} URLs[/green]")
-    if verbose:
-        for url in discovered_urls:
-            console.print(f"  [cyan]-[/cyan] {url.url}")
-
-    # Step 2: Fuzz
-    console.print()
-    console.print("[bold yellow]Step 2/4:[/bold yellow] Fuzzing parameters...", style="cyan")
     fuzzer = Fuzzer(timeout=10.0, max_concurrent=threads)
-    all_fuzz_results: list = []
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        fuzz_task = progress.add_task("Fuzzing...", total=len(discovered_urls))
+    # Share a single session (cookies, headers) across crawl and fuzz phases
+    # so CSRF tokens and session state discovered during crawling are honored
+    # while fuzzing protected endpoints.
+    async with httpx.AsyncClient(
+        timeout=fuzzer.timeout, follow_redirects=True, cookies=cookies or None
+    ) as client:
+        if cookies:
+            gate = await _probe_login_gate(client, target_url)
+            if gate:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Session cookie(s) do not appear "
+                    f"effective - {gate}. XSS/SQLi findings on protected "
+                    "endpoints are likely to be missed."
+                )
 
-        async with httpx.AsyncClient(timeout=fuzzer.timeout, follow_redirects=True) as client:
+        # Step 1: Crawl
+        console.print("[bold yellow]Step 1/4:[/bold yellow] Crawling target...", style="cyan")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            crawl_task = progress.add_task("Crawling...", total=None)
+            try:
+                discovered_urls = await do_crawl(target_url, max_depth=depth, client=client)
+                progress.remove_task(crawl_task)
+            except Exception as e:
+                console.print(f"[red]Crawling failed:[/red] {e}")
+                return 1
+
+        console.print(f"[green]Found {len(discovered_urls)} URLs[/green]")
+        if verbose:
+            for url in discovered_urls:
+                console.print(f"  [cyan]-[/cyan] {url.url}")
+
+        # Step 2: Fuzz
+        console.print()
+        console.print("[bold yellow]Step 2/4:[/bold yellow] Fuzzing parameters...", style="cyan")
+        all_fuzz_results: list = []
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            fuzz_task = progress.add_task("Fuzzing...", total=len(discovered_urls))
+
             for url_info in discovered_urls:
                 progress.update(fuzz_task, description=f"Fuzzing: {url_info.url[:50]}")
                 results = await fuzzer.fuzz_all(client, url_info, VULNERABILITY_PAYLOADS)
@@ -270,6 +362,7 @@ def main() -> int:
                 threads=args.threads,
                 output_dir=args.output,
                 verbose=args.verbose,
+                cookies=parse_cookie_string(args.cookie),
             )
         )
     except KeyboardInterrupt:
